@@ -7,6 +7,7 @@ Completeness is computed in Python from which fields actually arrived.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -104,61 +105,123 @@ def _extract_odds_snapshot(odds_event: dict) -> dict:
     return snapshot
 
 
-async def fetch_fixtures(target_date: date, fd: FootballDataClient | None = None) -> list[dict]:
+def _kickoff_on_day(utc_iso: str, target_date: date) -> datetime | None:
+    try:
+        kickoff = datetime.fromisoformat((utc_iso or "").replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if kickoff.date() != target_date:
+        return None
+    return kickoff
+
+
+def _odds_event_to_fixture(event: dict, code: str) -> dict:
+    return {
+        "id": event.get("id"),
+        "utcDate": event.get("commence_time"),
+        "status": "TIMED",
+        "homeTeam": {"id": None, "name": event.get("home_team")},
+        "awayTeam": {"id": None, "name": event.get("away_team")},
+        "competition": {"code": code},
+        "_competition_code": code,
+        "_odds_event": event,
+    }
+
+
+async def fetch_fixtures_from_odds(target_date: date) -> list[dict]:
+    """Free fixture list from The Odds API (same key you already have)."""
     leagues = load_league_ids()
-    date_str = target_date.isoformat()
-    fd = fd or shared_client()
     now = datetime.now(timezone.utc)
     kept: list[dict] = []
+    for code in leagues:
+        sport_key = ODDS_SPORT_KEYS.get(code)
+        if not sport_key:
+            continue
+        events = await fetch_league_odds(sport_key)
+        await asyncio.sleep(0.3)
+        n_today = 0
+        for event in events:
+            kickoff = _kickoff_on_day(event.get("commence_time") or "", target_date)
+            if kickoff is None or kickoff <= now:
+                continue
+            n_today += 1
+            kept.append(_odds_event_to_fixture(event, code))
+        logger.info("[SCOUT] Odds API %s: %s event(s) on %s.", code, n_today, target_date)
+    return kept
 
+
+async def fetch_fixtures_from_football_data(target_date: date, fd: FootballDataClient | None = None) -> list[dict]:
+    leagues = load_league_ids()
+    fd = fd or shared_client()
+    now = datetime.now(timezone.utc)
+    date_from = target_date.isoformat()
+    date_to = (target_date + timedelta(days=1)).isoformat()
+    matches: list[dict] = []
     async with httpx.AsyncClient(timeout=30) as http:
-        try:
-            payload = await fd.get(
-                http,
-                "/matches",
-                params={
-                    "dateFrom": date_str,
-                    "dateTo": date_str,
-                    "competitions": ",".join(leagues.keys()),
-                },
-            )
-            matches = payload.get("matches") or []
-        except Exception as exc:
-            logger.warning("[SCOUT] Combined fixture fetch failed (%s) — falling back per league.", exc)
-            matches = []
-            for code in leagues:
-                try:
-                    payload = await fd.get(
-                        http,
-                        f"/competitions/{code}/matches",
-                        params={"dateFrom": date_str, "dateTo": date_str},
-                    )
-                    chunk = payload.get("matches") or []
-                    for m in chunk:
-                        m.setdefault("competition", {})["code"] = code
-                    matches.extend(chunk)
-                except Exception as exc2:
-                    logger.warning("[SCOUT] Fixture fetch failed for %s: %s", code, exc2)
-
+        for code in leagues:
+            try:
+                payload = await fd.get(
+                    http,
+                    f"/competitions/{code}/matches",
+                    params={"dateFrom": date_from, "dateTo": date_to},
+                )
+                chunk = payload.get("matches") or []
+                logger.info("[SCOUT] football-data %s raw=%s", code, len(chunk))
+                for m in chunk:
+                    m.setdefault("competition", {})["code"] = code
+                matches.extend(chunk)
+            except Exception as exc:
+                logger.warning("[SCOUT] football-data %s failed: %s", code, exc)
+    kept: list[dict] = []
     for m in matches:
         code = (m.get("competition") or {}).get("code")
         if code not in leagues:
             continue
-        status = (m.get("status") or "").upper()
-        if status not in PLAYABLE_STATUS:
+        if (m.get("status") or "").upper() not in PLAYABLE_STATUS:
             continue
-        utc = m.get("utcDate") or ""
-        try:
-            kickoff = datetime.fromisoformat(utc.replace("Z", "+00:00"))
-            if kickoff <= now:
-                continue
-        except ValueError:
+        kickoff = _kickoff_on_day(m.get("utcDate") or "", target_date)
+        if kickoff is None or kickoff <= now:
             continue
         m["_competition_code"] = code
         kept.append(m)
-
-    logger.info("[SCOUT] %s upcoming fixture(s) in %s.", len(kept), list(leagues.values()))
     return kept
+
+
+def _merge_fd_ids(odds_fixtures: list[dict], fd_fixtures: list[dict]) -> list[dict]:
+    index = []
+    for fd in fd_fixtures:
+        home = _normalize_team_name((fd.get("homeTeam") or {}).get("name") or "")
+        away = _normalize_team_name((fd.get("awayTeam") or {}).get("name") or "")
+        index.append((home, away, fd))
+    for fx in odds_fixtures:
+        home = _normalize_team_name((fx.get("homeTeam") or {}).get("name") or "")
+        away = _normalize_team_name((fx.get("awayTeam") or {}).get("name") or "")
+        for eh, ea, fd in index:
+            if (eh in home or home in eh) and (ea in away or away in ea):
+                fx["id"] = fd.get("id")
+                fx["homeTeam"]["id"] = (fd.get("homeTeam") or {}).get("id")
+                fx["awayTeam"]["id"] = (fd.get("awayTeam") or {}).get("id")
+                break
+    return odds_fixtures
+
+
+async def fetch_fixtures(target_date: date, fd: FootballDataClient | None = None) -> list[dict]:
+    leagues = load_league_ids()
+    odds_fx = await fetch_fixtures_from_odds(target_date)
+    fd_fx: list[dict] = []
+    try:
+        fd_fx = await fetch_fixtures_from_football_data(target_date, fd=fd)
+    except Exception as exc:
+        logger.warning("[SCOUT] football-data enrich failed: %s", exc)
+    if odds_fx:
+        kept = _merge_fd_ids(odds_fx, fd_fx)
+        logger.info("[SCOUT] %s upcoming fixture(s) from Odds API (free).", len(kept))
+        return kept
+    if fd_fx:
+        logger.info("[SCOUT] %s upcoming fixture(s) from football-data.org (free).", len(fd_fx))
+        return fd_fx
+    logger.info("[SCOUT] 0 upcoming fixture(s) in %s.", list(leagues.values()))
+    return []
 
 
 async def fetch_league_odds(sport_key: str) -> list[dict]:
