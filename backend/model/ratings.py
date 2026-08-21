@@ -17,6 +17,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
 import math
+import re
 
 from backend.config import (
     HALF_LIFE_DAYS,
@@ -194,7 +195,39 @@ def build_league_models(matches: list[MatchResult], as_of: date) -> dict[str, Le
     return models
 
 
-def predict_match(model: LeagueModel, home_id: int, away_id: int) -> dict | None:
+def _norm_name(name: str) -> str:
+    name = (name or "").strip().lower()
+    name = name.replace("&", "and")
+    for suffix in (" fc", " cf", " afc", " cd", " sd", " ac"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def resolve_team_id(model: LeagueModel, team_id: int | None, team_name: str | None) -> int | None:
+    if team_id and team_id in model.ratings:
+        return int(team_id)
+    needle = _norm_name(team_name or "")
+    if not needle:
+        return None
+    for rating in model.ratings.values():
+        cand = _norm_name(rating.name)
+        if cand == needle or needle in cand or cand in needle:
+            return rating.team_id
+    return None
+
+
+def predict_match(
+    model: LeagueModel,
+    home_id: int | None,
+    away_id: int | None,
+    home_name: str | None = None,
+    away_name: str | None = None,
+) -> dict | None:
+    home_id = resolve_team_id(model, home_id, home_name)
+    away_id = resolve_team_id(model, away_id, away_name)
+    if not home_id or not away_id:
+        return None
     home = model.ratings.get(home_id)
     away = model.ratings.get(away_id)
     if not home or not away:
