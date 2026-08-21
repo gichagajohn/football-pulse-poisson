@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import date
 from urllib.parse import urlparse
 
@@ -22,6 +23,34 @@ from backend.config import env
 logger = logging.getLogger(__name__)
 
 _CACHED_URL: str | None = None
+
+# Retries for transient network blips (DNS not yet warm on a cold GitHub
+# Actions runner, brief connect timeouts) — NOT for 4xx/5xx from Supabase
+# itself, which raise_for_status() surfaces normally.
+_RETRY_ATTEMPTS = 3
+_RETRY_BACKOFF_SECONDS = 1.5
+
+
+def _request(method: str, url: str, **kwargs) -> httpx.Response:
+    last_exc: Exception | None = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            return httpx.request(method, url, **kwargs)
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            last_exc = exc
+            if attempt < _RETRY_ATTEMPTS - 1:
+                wait = _RETRY_BACKOFF_SECONDS * (attempt + 1)
+                logger.warning(
+                    "[SUPABASE] %s %s failed (%s), retrying in %.1fs (attempt %s/%s)...",
+                    method,
+                    url,
+                    exc,
+                    wait,
+                    attempt + 1,
+                    _RETRY_ATTEMPTS,
+                )
+                time.sleep(wait)
+    raise last_exc  # pragma: no cover — loop always returns or raises above
 
 
 def _url() -> str:
@@ -106,7 +135,7 @@ def store_ticket(
     }
 
     try:
-        resp = httpx.post(
+        resp = _request("POST", 
             f"{_url()}/rest/v1/prediction_tickets",
             headers=_headers("resolution=merge-duplicates"),
             params={"on_conflict": "ticket_date"},
@@ -121,7 +150,7 @@ def store_ticket(
 
     # Re-runs must not duplicate legs.
     try:
-        httpx.delete(
+        _request("DELETE", 
             f"{_url()}/rest/v1/ticket_selections",
             headers=_headers(),
             params={"ticket_date": f"eq.{target_date.isoformat()}"},
@@ -149,7 +178,7 @@ def store_ticket(
     ]
 
     try:
-        resp = httpx.post(
+        resp = _request("POST", 
             f"{_url()}/rest/v1/ticket_selections",
             headers=_headers(),
             json=selection_rows,
@@ -165,7 +194,7 @@ def get_pending_tickets(before_date: date) -> list[dict]:
     if not _enabled():
         return []
     try:
-        resp = httpx.get(
+        resp = _request("GET", 
             f"{_url()}/rest/v1/prediction_tickets",
             headers=_headers(),
             params={
@@ -187,7 +216,7 @@ def get_selections_for_date(ticket_date: date) -> list[dict]:
     if not _enabled():
         return []
     try:
-        resp = httpx.get(
+        resp = _request("GET", 
             f"{_url()}/rest/v1/ticket_selections",
             headers=_headers(),
             params={"ticket_date": f"eq.{ticket_date.isoformat()}", "select": "*"},
@@ -204,7 +233,7 @@ def get_selections_since(cutoff: date) -> list[dict]:
     if not _enabled():
         return []
     try:
-        resp = httpx.get(
+        resp = _request("GET", 
             f"{_url()}/rest/v1/ticket_selections",
             headers=_headers(),
             params={
@@ -235,7 +264,7 @@ def update_selection_outcome(
     if away_score is not None:
         payload["away_score"] = away_score
     try:
-        resp = httpx.patch(
+        resp = _request("PATCH", 
             f"{_url()}/rest/v1/ticket_selections",
             headers=_headers(),
             params={"id": f"eq.{selection_id}"},
@@ -251,7 +280,7 @@ def update_ticket_outcome(ticket_date: date, outcome: str) -> None:
     if not _enabled():
         return
     try:
-        resp = httpx.patch(
+        resp = _request("PATCH", 
             f"{_url()}/rest/v1/prediction_tickets",
             headers=_headers(),
             params={"ticket_date": f"eq.{ticket_date.isoformat()}"},
@@ -268,7 +297,7 @@ def get_recent_tickets(limit: int = 30) -> list[dict]:
     if not _enabled():
         return []
     try:
-        resp = httpx.get(
+        resp = _request("GET", 
             f"{_url()}/rest/v1/prediction_tickets",
             headers=_headers(),
             params={"select": "*", "order": "ticket_date.desc", "limit": str(limit)},
