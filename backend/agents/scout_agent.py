@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
@@ -302,20 +302,13 @@ async def run(target_date: date | None = None, fd: FootballDataClient | None = N
     leagues = load_league_ids()
     logger.info("[SCOUT] %s — leagues %s", target_date, list(leagues.values()))
 
-    fd = fd or FootballDataClient()
+    fd = fd or shared_client()
     fixtures = await fetch_fixtures(target_date, fd=fd)
     if not fixtures:
         logger.warning("[SCOUT] No upcoming fixtures.")
         return []
 
     codes_present = {f["_competition_code"] for f in fixtures}
-    odds_by_league: dict[str, list[dict]] = {}
-    for code in codes_present:
-        sport_key = ODDS_SPORT_KEYS.get(code)
-        if not sport_key:
-            continue
-        odds_by_league[code] = await fetch_league_odds(sport_key)
-        await asyncio.sleep(0.4)
 
     epl_injuries: dict[str, list[dict]] = {}
     if "PL" in codes_present:
@@ -328,8 +321,7 @@ async def run(target_date: date | None = None, fd: FootballDataClient | None = N
         away = fixture["awayTeam"]
         home_name = home.get("name") or "?"
         away_name = away.get("name") or "?"
-        events = odds_by_league.get(code, [])
-        matched = _find_match_odds(events, home_name, away_name)
+        matched = fixture.get("_odds_event") or {}
         odds_snapshot = _extract_odds_snapshot(matched) if matched else {}
 
         venue_city = get_venue_city(home_name)
@@ -338,8 +330,18 @@ async def run(target_date: date | None = None, fd: FootballDataClient | None = N
         home_injuries = _lookup_epl_injuries(epl_injuries, home_name) if code == "PL" else []
         away_injuries = _lookup_epl_injuries(epl_injuries, away_name) if code == "PL" else []
 
+        raw_id = fixture.get("id")
+        if isinstance(raw_id, int):
+            fixture_id = raw_id
+        elif raw_id:
+            fixture_id = int(hashlib.sha256(str(raw_id).encode()).hexdigest()[:15], 16)
+        else:
+            fixture_id = int(
+                hashlib.sha256(f"{home_name}|{away_name}|{fixture.get('utcDate')}".encode()).hexdigest()[:15],
+                16,
+            )
         structured = {
-            "fixture_id": fixture.get("id"),
+            "fixture_id": fixture_id,
             "home_team_id": home.get("id"),
             "away_team_id": away.get("id"),
             "home_team": home_name,
