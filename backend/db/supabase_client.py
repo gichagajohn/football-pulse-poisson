@@ -11,7 +11,9 @@ Required:
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date
+from urllib.parse import urlparse
 
 import httpx
 
@@ -19,9 +21,42 @@ from backend.config import env
 
 logger = logging.getLogger(__name__)
 
+_CACHED_URL: str | None = None
+
 
 def _url() -> str:
-    return env("SUPABASE_URL").rstrip("/")
+    """
+    Accepts any of:
+      https://xxxx.supabase.co
+      https://xxxx.supabase.co/
+      https://xxxx.supabase.co/rest/v1/
+    Strips quotes/whitespace. Logs only the hostname (never the key).
+    """
+    global _CACHED_URL
+    if _CACHED_URL is not None:
+        return _CACHED_URL
+    raw = env("SUPABASE_URL")
+    raw = raw.strip().strip('"').strip("'").replace("\n", "").replace("\r", "")
+    if not raw:
+        _CACHED_URL = ""
+        return ""
+    if not raw.lower().startswith("http"):
+        raw = "https://" + raw.lstrip("/")
+    raw = re.sub(r"/rest/v1/?.*$", "", raw, flags=re.IGNORECASE)
+    raw = raw.rstrip("/")
+    parsed = urlparse(raw)
+    host = parsed.netloc.lower()
+    if not host.endswith(".supabase.co"):
+        logger.error(
+            "[SUPABASE] SUPABASE_URL host is not *.supabase.co (got %r). "
+            "Use https://YOURPROJECT.supabase.co with no /rest/v1/.",
+            host or raw[:60],
+        )
+        _CACHED_URL = ""
+        return ""
+    _CACHED_URL = f"{parsed.scheme}://{host}"
+    logger.info("[SUPABASE] Host=%s", host)
+    return _CACHED_URL
 
 
 def _key() -> str:
