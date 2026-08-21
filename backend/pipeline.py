@@ -68,9 +68,13 @@ async def run_pipeline(target_date: date | None = None) -> str:
             logger.info("[4/5] No ratings for %s — skip %s vs %s", code, match.get("home_team"), match.get("away_team"))
             priced.append(match)
             continue
-        home_id = match.get("home_team_id")
-        away_id = match.get("away_team_id")
-        pred = predict_match(model, home_id, away_id) if home_id and away_id else None
+        pred = predict_match(
+            model,
+            match.get("home_team_id"),
+            match.get("away_team_id"),
+            home_name=match.get("home_team"),
+            away_name=match.get("away_team"),
+        )
         if not pred:
             logger.info(
                 "[4/5] Insufficient history: %s vs %s",
