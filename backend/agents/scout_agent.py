@@ -224,7 +224,22 @@ async def fetch_fixtures(target_date: date, fd: FootballDataClient | None = None
     return []
 
 
-async def fetch_league_odds(sport_key: str) -> list[dict]:
+def _merge_btts_into_featured(featured: list[dict], btts: list[dict]) -> list[dict]:
+    """Merge a separate btts odds response into the featured (h2h/totals) response, by event id."""
+    btts_by_id = {ev.get("id"): ev for ev in btts if ev.get("id")}
+    for event in featured:
+        btts_event = btts_by_id.get(event.get("id"))
+        if not btts_event:
+            continue
+        btts_books_by_key = {b.get("key"): b for b in btts_event.get("bookmakers") or []}
+        for book in event.get("bookmakers") or []:
+            btts_book = btts_books_by_key.get(book.get("key"))
+            if btts_book:
+                book.setdefault("markets", []).extend(btts_book.get("markets") or [])
+    return featured
+
+
+async def _fetch_odds_market(sport_key: str, markets: str) -> list[dict]:
     async with httpx.AsyncClient(timeout=20) as http:
         try:
             resp = await http.get(
@@ -232,7 +247,7 @@ async def fetch_league_odds(sport_key: str) -> list[dict]:
                 params={
                     "apiKey": env("ODDS_API_KEY"),
                     "regions": "eu",
-                    "markets": "h2h,totals,btts",
+                    "markets": markets,
                     "oddsFormat": "decimal",
                 },
             )
@@ -240,8 +255,28 @@ async def fetch_league_odds(sport_key: str) -> list[dict]:
             data = resp.json()
             return data if isinstance(data, list) else []
         except Exception as exc:
-            logger.warning("[SCOUT] Odds fetch failed for %s: %s", sport_key, exc)
+            logger.warning("[SCOUT] Odds fetch failed for %s (%s): %s", sport_key, markets, exc)
             return []
+
+
+async def fetch_league_odds(sport_key: str) -> list[dict]:
+    """
+    The Odds API's /odds endpoint only accepts "featured" markets, and will
+    reject the ENTIRE request (422) if any requested market isn't featured
+    for that endpoint — even if the other markets are fine. btts isn't
+    guaranteed to be featured for every competition/plan, and mixing it into
+    one call with h2h/totals was taking down every league at once.
+
+    Fetch h2h/totals and btts as two separate calls and merge by event id,
+    so a btts rejection no longer costs us the fixtures and core odds too.
+    """
+    featured = await _fetch_odds_market(sport_key, "h2h,totals")
+    if not featured:
+        return []
+    btts = await _fetch_odds_market(sport_key, "btts")
+    if btts:
+        featured = _merge_btts_into_featured(featured, btts)
+    return featured
 
 
 async def fetch_epl_injuries() -> dict[str, list[dict]]:
