@@ -1,0 +1,50 @@
+name: Football Pulse AI — Daily Ticket
+on:
+  schedule:
+    # 05:20 UTC = 08:20 EAT (offset so it does not collide with football_ai at 08:00)
+    - cron: "20 5 * * *"
+  workflow_dispatch:
+    inputs:
+      league_ids:
+        description: "Comma-separated football-data.org codes (blank = top-5 + UCL)"
+        required: false
+        default: ""
+      max_selections:
+        description: "Max independent singles (blank = 3)"
+        required: false
+        default: ""
+concurrency:
+  group: football-pulse-daily
+  cancel-in-progress: false
+jobs:
+  daily-prediction:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run tests
+        run: pytest
+      - name: Run daily pipeline
+        env:
+          FOOTBALL_DATA_KEY: ${{ secrets.FOOTBALL_DATA_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          OPENWEATHER_KEY: ${{ secrets.OPENWEATHER_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          LEAGUE_IDS: ${{ github.event.inputs.league_ids }}
+          MAX_SELECTIONS: ${{ github.event.inputs.max_selections }}
+        run: python -m backend.daily_run
