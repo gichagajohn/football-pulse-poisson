@@ -193,16 +193,26 @@ def _merge_fd_ids(odds_fixtures: list[dict], fd_fixtures: list[dict]) -> list[di
         home = _normalize_team_name((fd.get("homeTeam") or {}).get("name") or "")
         away = _normalize_team_name((fd.get("awayTeam") or {}).get("name") or "")
         index.append((home, away, fd))
+    matched: list[dict] = []
     for fx in odds_fixtures:
         home = _normalize_team_name((fx.get("homeTeam") or {}).get("name") or "")
         away = _normalize_team_name((fx.get("awayTeam") or {}).get("name") or "")
         for eh, ea, fd in index:
             if (eh in home or home in eh) and (ea in away or away in ea):
+                # Only retain fixtures with a real football-data.org ID.
+                # The Odds API ID is not accepted by the result checker; using
+                # a hash here would create tickets that can never be graded.
                 fx["id"] = fd.get("id")
                 fx["homeTeam"]["id"] = (fd.get("homeTeam") or {}).get("id")
                 fx["awayTeam"]["id"] = (fd.get("awayTeam") or {}).get("id")
+                matched.append(fx)
                 break
-    return odds_fixtures
+    logger.info(
+        "[SCOUT] Matched %s/%s Odds API fixture(s) to football-data IDs.",
+        len(matched),
+        len(odds_fixtures),
+    )
+    return matched
 
 
 async def fetch_fixtures(target_date: date, fd: FootballDataClient | None = None) -> list[dict]:
@@ -215,8 +225,13 @@ async def fetch_fixtures(target_date: date, fd: FootballDataClient | None = None
         logger.warning("[SCOUT] football-data enrich failed: %s", exc)
     if odds_fx:
         kept = _merge_fd_ids(odds_fx, fd_fx)
-        logger.info("[SCOUT] %s upcoming fixture(s) from Odds API (free).", len(kept))
-        return kept
+        if kept:
+            logger.info("[SCOUT] %s upcoming fixture(s) from Odds API (free).", len(kept))
+            return kept
+        logger.warning(
+            "[SCOUT] Odds fixtures could not be matched to football-data IDs; "
+            "falling back to football-data fixtures without odds."
+        )
     if fd_fx:
         logger.info("[SCOUT] %s upcoming fixture(s) from football-data.org (free).", len(fd_fx))
         return fd_fx
@@ -251,6 +266,16 @@ async def _fetch_odds_market(sport_key: str, markets: str) -> list[dict]:
                     "oddsFormat": "decimal",
                 },
             )
+            if resp.status_code == 422:
+                # BTTS is not a featured market for every league/plan. This
+                # is an expected capability response, not a pipeline failure;
+                # h2h/totals were fetched separately and remain usable.
+                logger.info(
+                    "[SCOUT] Odds market unavailable for %s (%s); continuing without it.",
+                    sport_key,
+                    markets,
+                )
+                return []
             resp.raise_for_status()
             data = resp.json()
             return data if isinstance(data, list) else []
