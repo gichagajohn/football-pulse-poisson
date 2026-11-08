@@ -20,12 +20,16 @@ tickets.
 A pick is emailed only if all of these hold:
 
 1. Both clubs have enough weighted history
-2. Model probability is high (e.g. home win ≥ 58%)
+2. The probability is high (e.g. home win ≥ 58%) — the model's own, unless
+   `MODEL_WEIGHT` is lowered to blend it with the de-vigged market price
 3. Odds sit in a conservative band (no 1.05 traps, no longshots)
-4. EV = `model_p × odds − 1` ≥ ~4%
+4. EV = `p × odds − 1` ≥ ~4%
 5. One market per match, max 3 singles (never an accumulator)
+6. The Odds API still has credits left, and the fixture matched a real
+   football-data.org ID (same clubs, same competition, kickoff within 30 min)
 
-The ticket prints λ, model %, book %, and EV so you can check the arithmetic.
+The ticket prints λ, model %, market %, blended %, book % and EV so you can
+check the arithmetic — and see by how much the "edge" was model disagreement.
 
 **This is still gambling.** “Sure” means transparent and conservative, not
 guaranteed.
@@ -129,6 +133,92 @@ python -m backend.daily_run
 
 Scorelines ~ Poisson(λ) with Dixon-Coles ρ ≈ −0.10 on 0-0 / 1-0 / 0-1 / 1-1.
 Thresholds live in `backend/config.py`.
+
+### ⚠️ The backtest result (read this before trusting a pick)
+
+`scripts/backtest.py` replays 4 seasons x 5 leagues of real Bet365 prices and
+real results — ~28,000 matches — using the same ratings, Poisson and selector
+code as production, refitting only on matches already played:
+
+```
+MODEL_WEIGHT   bets   hit%   avg odds     ROI      avg CLV
+1.00           2472   56.2       1.71   -5.53%      -0.40%
+0.80           2199   55.9       1.70   -6.43%      -0.44%
+0.60           1736   55.2       1.69   -8.05%      -0.44%
+0.40            993   52.5       1.68  -12.78%      -0.63%
+```
+
+**Every setting loses money, and the average closing-line value is negative.**
+There is no positive-EV configuration of these gates in this sample. Compare
+against flat-betting the same markets with no model at all:
+
+```
+market           bets      ROI
+home_win         7082   -8.22%
+away_win         7082  -10.14%
+over25           7082   -3.96%
+1x2_favourite    7082   -2.08%
+```
+
+The model's own 1X2 picks do **−16.3%** (home) and **−20.9%** (away) at
+w=0.6 — worse than blind betting, i.e. the gates actively select bad bets.
+Its O2.5 picks (−4.85%) are merely indistinguishable from the vig (−3.96%).
+
+And the model is not calibrated where it bets:
+
+```
+ 60– 80%  predicted 68.4%  realised 61.4%  delta -7.0   <- the band the gates bet in
+ 80–100%  predicted 85.1%  realised 77.6%  delta -7.5
+```
+
+A goal-only Poisson is systematically overconfident on strong favourites
+(classic favourite–longshot bias). That is `min_p: 0.58–0.78` territory, so
+every published 1X2 single is drawn from the model's most biased band.
+
+Treat the ticket as a documented record of a statistical model, not as a
+betting edge. Reproduce with:
+
+```bash
+python -m scripts.backtest                          # all leagues, 4 seasons
+python -m scripts.backtest --seasons 2526 --divs E0
+```
+
+### Model vs market — the knob, and why it defaults to off
+
+The gates can run on a probability shrunk toward the de-vigged market price:
+
+```
+p_adj = MODEL_WEIGHT × model_p + (1 − MODEL_WEIGHT) × market_p_devigged
+```
+
+`MODEL_WEIGHT` defaults to **1.0** (the raw model). It was 0.6 in the first
+draft of these changes, on the theory that a goal-only model should not win an
+argument with 40 books; the backtest then showed shrinkage makes the *loss per
+bet* worse, because the picks that survive it are the highest-disagreement
+fixtures. The knob is kept for experimentation, and each pick prints
+model / market / blended / EV plus `ev_raw` so any setting is auditable.
+
+### Odds API budget (this matters on the free plan)
+
+The free plan is **500 credits/month**, and one credit = one market × one
+region. Daily h2h + totals across 6 leagues = 12 credits/day ≈ 360/month,
+which fits. BTTS is a third credit per league per day ≈ 540/month, which does
+not fit — so `ODDS_FETCH_BTTS` is **off by default**, and the run stops
+cleanly (NO BET with a quota reason) when `x-requests-remaining` reaches
+`ODDS_MIN_CREDITS_REMAINING`.
+
+Match markets are **1X2, O2.5 and BTTS only**. Double chance was removed: The
+Odds API publishes no DC market, so its price was reverse-engineered from
+vigged 1X2 and its "EV" was measured against a number no book offers.
+
+### History: what the free tier does not give you
+
+football-data.org free is **current season only**, so the previous-season
+down-weighting (`PREVIOUS_SEASON_FACTOR`) has nothing to weight, and ratings
+need ~6–7 matches before `MIN_WEIGHTED_GAMES` is satisfied. Expect the bot to
+be quiet in August/September each season. A free upgrade path is
+`football-data.co.uk` CSVs (20+ seasons, no key) — that is the next real
+improvement to the model.
 
 ---
 

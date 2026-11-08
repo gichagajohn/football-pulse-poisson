@@ -10,15 +10,43 @@ import asyncio
 import hashlib
 import logging
 import re
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
 from backend.cities import get_venue_city
-from backend.config import ODDS_SPORT_KEYS, env, load_league_ids
+from backend.config import (
+    FIXTURE_MATCH_TOLERANCE_MINUTES,
+    ODDS_FETCH_BTTS,
+    ODDS_MIN_CREDITS_REMAINING,
+    ODDS_REGIONS,
+    ODDS_SPORT_KEYS,
+    env,
+    load_league_ids,
+)
 from backend.model.history import FootballDataClient, shared_client
 
 logger = logging.getLogger(__name__)
+
+
+class OddsQuotaExhausted(RuntimeError):
+    """Raised when The Odds API refuses to serve more requests.
+
+    Auth failures (401/403) and rate/credit exhaustion (429, or
+    x-requests-remaining at or below the configured floor) are terminal for
+    the run: continuing would silently produce an odds-free ticket that looks
+    exactly like a genuine NO BET.
+    """
+
+
+# Credits left on the plan, refreshed from the response headers. None = unknown.
+_CREDITS_REMAINING: int | None = None
+
+
+def credits_remaining() -> int | None:
+    return _CREDITS_REMAINING
+
 
 FPL_NAME_ALIASES = {
     "Nott'm Forest": "Nottingham Forest",
@@ -32,26 +60,82 @@ FPL_NAME_ALIASES = {
 
 PLAYABLE_STATUS = {"TIMED", "SCHEDULED"}
 
+# Club-name tokens that carry no identifying information.
+_LEGAL_TOKENS = {
+    "fc", "cf", "afc", "cd", "sd", "ac", "sc", "ss", "as", "sv", "vfb", "vfl",
+    "bk", "if", "ff", "calcio", "club", "de", "futbol", "football", "soccer",
+    "the",
+}
+
+
+def _fold(name: str) -> str:
+    """Lowercase, strip accents, drop punctuation: 'Mönchengladbach' → 'monchengladbach'."""
+    cleaned = unicodedata.normalize("NFKD", name or "")
+    cleaned = "".join(c for c in cleaned if not unicodedata.combining(c))
+    cleaned = cleaned.lower().replace("&", " and ")
+    cleaned = re.sub(r"[^a-z0-9 ]+", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _tokens(name: str) -> frozenset[str]:
+    parts = [p for p in _fold(name).split(" ") if p]
+    core = [p for p in parts if p not in _LEGAL_TOKENS]
+    return frozenset(core or parts)
+
 
 def _normalize_team_name(name: str) -> str:
-    name = (name or "").strip()
-    for suffix in (" FC", " CF", " AFC", " CD", " SD", " AC"):
-        if name.endswith(suffix):
-            name = name[: -len(suffix)]
-    name = name.replace("&", "and")
-    name = re.sub(r"\s+", " ", name)
-    return name.strip().lower()
+    """Legacy flat string form, kept for stability in logs and FPL lookups."""
+    return _fold(name)
+
+
+def _teams_match(left: str, right: str) -> bool:
+    """Token-set comparison instead of substring 'in'.
+
+    Substrings bind the wrong club ('Sporting' in 'Sporting CP' and
+    'Sporting Lisbon'; 'Inter' in 'Inter Milan' and 'Internazionale'), and a
+    wrong bind writes the wrong fixture_id, which then grades the bet against
+    somebody else's match.
+    """
+    a, b = _tokens(left), _tokens(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long = (a, b) if len(a) <= len(b) else (b, a)
+    if not short.issubset(long):
+        return False
+    # Require enough signal in the shorter name: 'real' must not match
+    # 'real madrid', but 'inter' may match 'inter milan'.
+    return len("".join(sorted(short))) >= 5
+
+
+def _kickoff_delta_minutes(left: str | None, right: str | None) -> float | None:
+    def parse(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (ValueError, AttributeError, TypeError):
+            return None
+
+    a, b = parse(left), parse(right)
+    if a is None or b is None:
+        return None
+    if a.tzinfo is None:
+        a = a.replace(tzinfo=timezone.utc)
+    if b.tzinfo is None:
+        b = b.replace(tzinfo=timezone.utc)
+    return abs((a - b).total_seconds()) / 60.0
 
 
 def _find_match_odds(odds_events: list[dict], home_name: str, away_name: str) -> dict:
-    home_norm = _normalize_team_name(home_name)
-    away_norm = _normalize_team_name(away_name)
     for event in odds_events:
-        eh = _normalize_team_name(event.get("home_team", ""))
-        ea = _normalize_team_name(event.get("away_team", ""))
-        if (eh in home_norm or home_norm in eh) and (ea in away_norm or away_norm in ea):
+        if _teams_match(event.get("home_team", ""), home_name) and _teams_match(
+            event.get("away_team", ""), away_name
+        ):
             return event
     return {}
+
 
 
 def _median(values: list[float]) -> float | None:
@@ -188,29 +272,91 @@ async def fetch_fixtures_from_football_data(target_date: date, fd: FootballDataC
 
 
 def _merge_fd_ids(odds_fixtures: list[dict], fd_fixtures: list[dict]) -> list[dict]:
-    index = []
+    """Attach football-data.org IDs to Odds API fixtures — or drop the fixture.
+
+    A candidate only binds when ALL of these hold:
+
+      1. home and away both match on token sets (not substrings)
+      2. same competition code
+      3. kickoff times within FIXTURE_MATCH_TOLERANCE_MINUTES
+      4. exactly one fixture competes for the bind (ambiguity → drop)
+      5. the matched football-data record actually carries an id
+
+    Rule 4 is the important one: a 50/50 guess here silently grades the bet
+    against a different match, which corrupts the weekly ROI rather than
+    raising anything.
+    """
+    index: list[tuple[str, str, str, dict]] = []
     for fd in fd_fixtures:
-        home = _normalize_team_name((fd.get("homeTeam") or {}).get("name") or "")
-        away = _normalize_team_name((fd.get("awayTeam") or {}).get("name") or "")
-        index.append((home, away, fd))
+        index.append(
+            (
+                (fd.get("homeTeam") or {}).get("name") or "",
+                (fd.get("awayTeam") or {}).get("name") or "",
+                (fd.get("competition") or {}).get("code") or "",
+                fd,
+            )
+        )
+
     matched: list[dict] = []
+    used_ids: set = set()
+    unmatched = 0
+    ambiguous = 0
+
     for fx in odds_fixtures:
-        home = _normalize_team_name((fx.get("homeTeam") or {}).get("name") or "")
-        away = _normalize_team_name((fx.get("awayTeam") or {}).get("name") or "")
-        for eh, ea, fd in index:
-            if (eh in home or home in eh) and (ea in away or away in ea):
-                # Only retain fixtures with a real football-data.org ID.
-                # The Odds API ID is not accepted by the result checker; using
-                # a hash here would create tickets that can never be graded.
-                fx["id"] = fd.get("id")
-                fx["homeTeam"]["id"] = (fd.get("homeTeam") or {}).get("id")
-                fx["awayTeam"]["id"] = (fd.get("awayTeam") or {}).get("id")
-                matched.append(fx)
-                break
+        home = (fx.get("homeTeam") or {}).get("name") or ""
+        away = (fx.get("awayTeam") or {}).get("name") or ""
+        code = fx.get("_competition_code") or ""
+        kickoff = fx.get("utcDate")
+
+        candidates: list[dict] = []
+        for fd_home, fd_away, fd_code, fd in index:
+            if not _teams_match(fd_home, home) or not _teams_match(fd_away, away):
+                continue
+            if code and fd_code and code != fd_code:
+                continue
+            delta = _kickoff_delta_minutes(kickoff, fd.get("utcDate"))
+            if delta is None or delta > FIXTURE_MATCH_TOLERANCE_MINUTES:
+                continue
+            if fd.get("id") is None:
+                continue
+            if fd["id"] in used_ids:
+                continue
+            candidates.append(fd)
+
+        if not candidates:
+            unmatched += 1
+            logger.warning(
+                "[SCOUT] No football-data match for %s vs %s (%s, %s) — fixture dropped.",
+                home,
+                away,
+                code or "?",
+                kickoff or "?",
+            )
+            continue
+        if len(candidates) > 1:
+            ambiguous += 1
+            logger.warning(
+                "[SCOUT] %s vs %s matched %s football-data fixtures — dropped as ambiguous.",
+                home,
+                away,
+                len(candidates),
+            )
+            continue
+
+        fd = candidates[0]
+        fx["id"] = fd["id"]
+        fx["homeTeam"]["id"] = (fd.get("homeTeam") or {}).get("id")
+        fx["awayTeam"]["id"] = (fd.get("awayTeam") or {}).get("id")
+        used_ids.add(fd["id"])
+        matched.append(fx)
+
     logger.info(
-        "[SCOUT] Matched %s/%s Odds API fixture(s) to football-data IDs.",
+        "[SCOUT] Matched %s/%s Odds API fixture(s) to football-data IDs "
+        "(%s unmatched, %s ambiguous, dropped).",
         len(matched),
         len(odds_fixtures),
+        unmatched,
+        ambiguous,
     )
     return matched
 
@@ -255,52 +401,84 @@ def _merge_btts_into_featured(featured: list[dict], btts: list[dict]) -> list[di
 
 
 async def _fetch_odds_market(sport_key: str, markets: str) -> list[dict]:
+    global _CREDITS_REMAINING
     async with httpx.AsyncClient(timeout=20) as http:
         try:
             resp = await http.get(
                 f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds",
                 params={
                     "apiKey": env("ODDS_API_KEY"),
-                    "regions": "eu",
+                    "regions": ODDS_REGIONS,
                     "markets": markets,
                     "oddsFormat": "decimal",
                 },
             )
-            if resp.status_code == 422:
-                # BTTS is not a featured market for every league/plan. This
-                # is an expected capability response, not a pipeline failure;
-                # h2h/totals were fetched separately and remain usable.
-                logger.info(
-                    "[SCOUT] Odds market unavailable for %s (%s); continuing without it.",
-                    sport_key,
-                    markets,
-                )
-                return []
-            resp.raise_for_status()
-            data = resp.json()
-            return data if isinstance(data, list) else []
         except Exception as exc:
             logger.warning("[SCOUT] Odds fetch failed for %s (%s): %s", sport_key, markets, exc)
             return []
+
+    # Credit accounting first: this header is free and decides whether we may
+    # keep spending. It arrives even on otherwise-unhelpful responses.
+    raw_remaining = resp.headers.get("x-requests-remaining")
+    if raw_remaining is not None:
+        try:
+            _CREDITS_REMAINING = int(float(raw_remaining))
+            logger.info("[SCOUT] Odds API credits remaining: %s", _CREDITS_REMAINING)
+        except ValueError:
+            pass
+
+    if resp.status_code in {401, 403}:
+        raise OddsQuotaExhausted(
+            f"Odds API rejected the key (HTTP {resp.status_code}). Check ODDS_API_KEY."
+        )
+    if resp.status_code == 429:
+        raise OddsQuotaExhausted("Odds API rate/credit limit hit (HTTP 429).")
+    if _CREDITS_REMAINING is not None and _CREDITS_REMAINING <= ODDS_MIN_CREDITS_REMAINING:
+        raise OddsQuotaExhausted(
+            f"Odds API credits remaining ({_CREDITS_REMAINING}) at or below the "
+            f"floor ({ODDS_MIN_CREDITS_REMAINING})."
+        )
+    if resp.status_code == 422:
+        # BTTS is not a featured market for every league/plan. This is an
+        # expected capability response, not a pipeline failure.
+        logger.info(
+            "[SCOUT] Odds market unavailable for %s (%s); continuing without it.",
+            sport_key,
+            markets,
+        )
+        return []
+    if resp.status_code != 200:
+        logger.warning(
+            "[SCOUT] Odds fetch for %s (%s) returned HTTP %s — skipping.",
+            sport_key,
+            markets,
+            resp.status_code,
+        )
+        return []
+    data = resp.json()
+    return data if isinstance(data, list) else []
 
 
 async def fetch_league_odds(sport_key: str) -> list[dict]:
     """
     The Odds API's /odds endpoint only accepts "featured" markets, and will
     reject the ENTIRE request (422) if any requested market isn't featured
-    for that endpoint — even if the other markets are fine. btts isn't
-    guaranteed to be featured for every competition/plan, and mixing it into
-    one call with h2h/totals was taking down every league at once.
+    for that endpoint — even if the other markets are fine.
 
-    Fetch h2h/totals and btts as two separate calls and merge by event id,
-    so a btts rejection no longer costs us the fixtures and core odds too.
+    Cost: one credit per market per region. h2h + totals = 2 credits per
+    league per run. BTTS is a THIRD credit per league per day, which on the
+    500-credit free plan is the difference between ~360/month (fits) and
+    ~540/month (dies mid-month). It is therefore off unless ODDS_FETCH_BTTS=1;
+    when it is on, it is fetched separately and merged by event id so a 422
+    cannot take down the core odds as well.
     """
     featured = await _fetch_odds_market(sport_key, "h2h,totals")
     if not featured:
         return []
-    btts = await _fetch_odds_market(sport_key, "btts")
-    if btts:
-        featured = _merge_btts_into_featured(featured, btts)
+    if ODDS_FETCH_BTTS:
+        btts = await _fetch_odds_market(sport_key, "btts")
+        if btts:
+            featured = _merge_btts_into_featured(featured, btts)
     return featured
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from datetime import date
 
+from backend.agents.scout_agent import OddsQuotaExhausted
 from backend.agents.scout_agent import run as run_scout
 from backend.db import supabase_client
 from backend.model.history import fetch_history
@@ -41,7 +42,17 @@ async def run_pipeline(target_date: date | None = None) -> str:
     logger.info("=" * 60)
 
     logger.info("[1/5] SCOUT")
-    intelligence = await run_scout(target_date)
+    try:
+        intelligence = await run_scout(target_date)
+    except OddsQuotaExhausted as exc:
+        logger.error("[1/5] Odds API quota exhausted: %s", exc)
+        ticket, portfolio, decision = _no_bet(
+            date_str,
+            "Odds API quota exhausted — no prices available, and a pick without a "
+            f"real book price is not a pick. ({exc})",
+        )
+        supabase_client.store_ticket(target_date, ticket, portfolio, decision)
+        return ticket
     logger.info("[1/5] %s fixture(s).", len(intelligence))
     if not intelligence:
         ticket, portfolio, decision = _no_bet(

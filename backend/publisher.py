@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 
+def _pct(value) -> str:
+    try:
+        return f"{float(value)*100:.1f}%"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
 def format_ticket(date_str: str, portfolio: dict, decision: dict) -> str:
     if decision.get("decision") != "PUBLISH" or not portfolio.get("selections"):
         reason = decision.get("reason") or portfolio.get("reason") or "Insufficient edge."
@@ -26,6 +33,8 @@ def format_ticket(date_str: str, portfolio: dict, decision: dict) -> str:
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
         "📐 Model: Dixon-Coles Poisson (free, no LLM)",
+        "   Gates use the model blended with the de-vigged market price",
+        "   — 'Blended' below is the number that had to clear the EV floor.",
         "🎟️  Ticket type: independent singles (NOT an accumulator)",
         f"⚠️  Overall risk: {portfolio.get('risk_level', 'Medium')}",
         "",
@@ -36,7 +45,10 @@ def format_ticket(date_str: str, portfolio: dict, decision: dict) -> str:
                 f"{i}. {sel.get('home_team')} vs {sel.get('away_team')} ({sel.get('league')})",
                 f"   Market: {sel.get('market_label') or sel.get('market')}",
                 f"   Odds: {sel.get('odds')}",
-                f"   Model: {float(sel.get('model_p', 0))*100:.1f}%   Book: {float(sel.get('implied_p', 0))*100:.1f}%   "
+                f"   Model: {float(sel.get('model_p', 0))*100:.1f}%   "
+                f"Market: {_pct(sel.get('market_p'))}   "
+                f"Blended: {_pct(sel.get('adj_p', sel.get('model_p')))}   "
+                f"Book price implies: {float(sel.get('implied_p', 0))*100:.1f}%   "
                 f"EV: {float(sel.get('ev', 0))*100:+.1f}%",
                 f"   λ: {sel.get('lambda_home')} – {sel.get('lambda_away')}",
                 f"   Reason: {sel.get('rationale', '')}",
