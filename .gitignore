@@ -7,3 +7,6 @@ __pycache__/
 .ruff_cache/
 *.pyc
 .DS_Store
+
+# Backtest CSV cache — re-downloadable, not source
+data/football-data/

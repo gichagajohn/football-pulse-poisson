@@ -12,14 +12,23 @@ from datetime import date
 
 import httpx
 
-from backend.config import FD_MIN_INTERVAL_SECONDS, env
+from backend.config import FD_MIN_INTERVAL_SECONDS, TICKET_MAX_PENDING_DAYS, env
 from backend.db import supabase_client
 
 logger = logging.getLogger(__name__)
 
 
+# Statuses that will never produce a score for this ticket date.
+DEAD_STATUSES = {"POSTPONED", "CANCELLED", "SUSPENDED", "ABANDONED"}
+
+
 def fetch_result(fixture_id: int) -> dict | None:
-    """Return final score or None if the match is not finished yet."""
+    """Return the final score, a dead-status marker, or None if still pending.
+
+    Distinguishing "not played yet" from "will never be played" matters:
+    otherwise a postponed leg keeps the whole ticket at `pending` forever and
+    the ticket is re-polled on every subsequent run.
+    """
     try:
         resp = httpx.get(
             f"https://api.football-data.org/v4/matches/{fixture_id}",
@@ -29,6 +38,8 @@ def fetch_result(fixture_id: int) -> dict | None:
         resp.raise_for_status()
         match = resp.json()
         status = (match.get("status") or "").upper()
+        if status in DEAD_STATUSES:
+            return {"status": status, "home_goals": None, "away_goals": None}
         if status not in {"FINISHED", "AWARDED"}:
             return None
         full = (match.get("score") or {}).get("fullTime") or {}
@@ -69,6 +80,23 @@ def grade_selection(market: str, home_goals: int, away_goals: int) -> str:
     return "void"
 
 
+def ticket_outcome(outcomes: list[str]) -> str:
+    """Aggregate leg outcomes for a singles ticket.
+
+    Singles are staked independently, so a void leg next to three winners is a
+    winning day — the void simply was not staked. (The old code called that
+    "mixed", which also meant the row never reached the weekly ROI either way.)
+    """
+    settled = [o for o in outcomes if o in {"win", "loss"}]
+    if not settled:
+        return "void"
+    if all(o == "win" for o in settled):
+        return "win"
+    if all(o == "loss" for o in settled):
+        return "loss"
+    return "mixed"
+
+
 def run(today: date | None = None) -> None:
     today = today or date.today()
     logger.info("[RESULT_CHECK] Pending tickets before %s...", today)
@@ -86,6 +114,8 @@ def run(today: date | None = None) -> None:
         all_graded = True
         outcomes: list[str] = []
 
+        expired = (today - ticket_date).days >= TICKET_MAX_PENDING_DAYS
+
         for sel in selections:
             existing = sel.get("outcome")
             if existing and existing != "pending":
@@ -95,7 +125,31 @@ def run(today: date | None = None) -> None:
             result = fetch_result(sel["fixture_id"])
             time.sleep(FD_MIN_INTERVAL_SECONDS)
             if result is None:
+                if expired:
+                    # Still no score after TICKET_MAX_PENDING_DAYS. A book
+                    # would have voided and settled; holding the ticket open
+                    # blocks nothing but costs a football-data call every run.
+                    logger.warning(
+                        "[RESULT_CHECK] %s vs %s never resolved (%s days) — void.",
+                        sel.get("home_team"),
+                        sel.get("away_team"),
+                        (today - ticket_date).days,
+                    )
+                    supabase_client.update_selection_outcome(sel["id"], "void")
+                    outcomes.append("void")
+                    continue
                 all_graded = False
+                continue
+
+            if result.get("home_goals") is None:
+                logger.info(
+                    "[RESULT_CHECK] %s vs %s is %s — void (a book voids this).",
+                    sel.get("home_team"),
+                    sel.get("away_team"),
+                    result.get("status"),
+                )
+                supabase_client.update_selection_outcome(sel["id"], "void")
+                outcomes.append("void")
                 continue
 
             outcome = grade_selection(sel["market"], result["home_goals"], result["away_goals"])
@@ -117,15 +171,7 @@ def run(today: date | None = None) -> None:
             outcomes.append(outcome)
 
         if all_graded and outcomes:
-            if all(o == "void" for o in outcomes):
-                ticket_outcome = "void"
-            elif all(o in {"win", "void"} for o in outcomes) and any(o == "win" for o in outcomes):
-                ticket_outcome = "win" if all(o == "win" for o in outcomes) else "mixed"
-            elif all(o == "loss" for o in outcomes):
-                ticket_outcome = "loss"
-            else:
-                ticket_outcome = "mixed"
-            supabase_client.update_ticket_outcome(ticket_date, ticket_outcome)
+            supabase_client.update_ticket_outcome(ticket_date, ticket_outcome(outcomes))
 
 
 if __name__ == "__main__":
